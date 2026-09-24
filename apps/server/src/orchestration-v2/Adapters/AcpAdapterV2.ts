@@ -637,15 +637,19 @@ export const AcpProviderCapabilitiesV2 = {
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
-function negotiatedCapabilities(
+export function negotiatedCapabilities(
   base: OrchestrationV2ProviderCapabilities,
   started: AcpSessionRuntimeStartResult,
+  flavor: Pick<AcpAdapterV2Flavor, "applyModelSelection">,
 ): OrchestrationV2ProviderCapabilities {
   const agent = started.initializeResult.agentCapabilities ?? {};
   const session = agent.sessionCapabilities;
   const setup = started.sessionSetupResult;
+  // A model config option (v2), which the generic setup path switches through,
+  // or the v1 `models` state when the flavor switches it via `session/set_model`.
   const hasModelConfig =
-    setup.configOptions?.some((option) => option.category === "model") === true;
+    setup.configOptions?.some((option) => option.category === "model") === true ||
+    (setup.models != null && flavor.applyModelSelection !== undefined);
   const canLoad = agent.loadSession === true;
   const canFork = session?.fork != null;
   return {
@@ -5977,7 +5981,7 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
         yield* Ref.set(activeSessionId, started.sessionId);
         yield* Ref.set(activeSessionSetup, started);
         rememberTerminalEnvironment(started.sessionId, input.threadId);
-        const capabilities = negotiatedCapabilities(flavor.capabilities, started);
+        const capabilities = negotiatedCapabilities(flavor.capabilities, started, flavor);
         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
         const canResumeSession =
           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;

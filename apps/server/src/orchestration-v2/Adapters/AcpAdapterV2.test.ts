@@ -86,6 +86,7 @@ import {
   acpToolCallDiffPatch,
   acpTurnStartShouldPreserveContinuation,
   makeAcpAdapterV2,
+  negotiatedCapabilities,
   type AcpAdapterV2ExtensionContext,
   type AcpAdapterV2Flavor,
   type AcpAdapterV2RuntimeInput,
@@ -107,6 +108,47 @@ const serverConfigLayer = ServerConfig.layerTest(process.cwd(), {
 const testLayer = Layer.mergeAll(NodeServices.layer, idAllocatorLayer, serverConfigLayer);
 const ACP_TEST_DRIVER = ProviderDriverKind.make("acp-test");
 const decodeUnknownJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+
+describe("negotiatedCapabilities", () => {
+  const initializeResult = { protocolVersion: 1, agentCapabilities: { loadSession: true } };
+
+  it("reports model switching for a model config option or v1 `models` a flavor can apply", () => {
+    const negotiated = (
+      sessionSetupResult: Record<string, unknown>,
+      flavor: Pick<AcpAdapterV2Flavor, "applyModelSelection"> = {},
+    ) =>
+      negotiatedCapabilities(
+        AcpProviderCapabilitiesV2,
+        {
+          sessionId: "session-1",
+          initializeResult,
+          sessionSetupResult: { sessionId: "session-1", ...sessionSetupResult },
+          modelConfigId: undefined,
+        },
+        flavor,
+      ).sessions.supportsModelSwitchInSession;
+    const models = { models: { currentModelId: "auto", availableModels: [{ modelId: "auto" }] } };
+    assert.isTrue(negotiated(models, { applyModelSelection: () => Effect.succeed("auto") }));
+    // The generic setup path only switches config options, so v1 `models`
+    // alone must not advertise a switch nobody performs.
+    assert.isFalse(negotiated(models));
+    assert.isTrue(
+      negotiated({
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            type: "select",
+            currentValue: "a",
+            options: [],
+          },
+        ],
+      }),
+    );
+    assert.isFalse(negotiated({}));
+  });
+});
 
 describe("acpProjectedCommandExitCode", () => {
   const successOutput = { type: "Bash", exit_code: 0 };
