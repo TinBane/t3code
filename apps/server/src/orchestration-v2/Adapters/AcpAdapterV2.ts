@@ -1013,6 +1013,55 @@ function providerRequestKind(kind: string | "unknown"): ProviderRequestKind {
   }
 }
 
+const ACP_TOOL_KINDS: ReadonlySet<unknown> = new Set<EffectAcpSchema.ToolKind>([
+  "read",
+  "edit",
+  "delete",
+  "move",
+  "search",
+  "execute",
+  "think",
+  "fetch",
+  "switch_mode",
+  "other",
+]);
+
+function isAcpToolKind(kind: unknown): kind is EffectAcpSchema.ToolKind {
+  return ACP_TOOL_KINDS.has(kind);
+}
+
+function isAcpToolCallLocations(
+  value: unknown,
+): value is ReadonlyArray<EffectAcpSchema.ToolCallLocation> {
+  return (
+    Array.isArray(value) && value.every((entry) => typeof unknownRecord(entry)?.path === "string")
+  );
+}
+
+/**
+ * ACP lets a permission request omit tool call fields the agent already sent in
+ * its `tool_call` update. Fill kind, title, and locations from that known state
+ * so the approval kind, policy, and grants all see the real operation. Fields
+ * present on the request win.
+ */
+function withKnownToolCall(
+  params: EffectAcpSchema.RequestPermissionRequest,
+  known: AcpToolCallState | undefined,
+): EffectAcpSchema.RequestPermissionRequest {
+  if (known === undefined) return params;
+  const { toolCall } = params;
+  const { title, locations } = known.data;
+  return {
+    ...params,
+    toolCall: {
+      ...toolCall,
+      ...(toolCall.kind == null && isAcpToolKind(known.kind) ? { kind: known.kind } : {}),
+      ...(toolCall.title == null && typeof title === "string" ? { title } : {}),
+      ...(toolCall.locations == null && isAcpToolCallLocations(locations) ? { locations } : {}),
+    },
+  };
+}
+
 function toolStatus(
   status: AcpToolCallState["status"],
 ): "pending" | "running" | "waiting" | "completed" | "failed" {
@@ -5444,9 +5493,13 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                 handlerGeneration,
                 Effect.gen(function* () {
                   const context = yield* activeContext;
+                  const request = withKnownToolCall(
+                    params,
+                    context.tools.get(params.toolCall.toolCallId),
+                  );
                   const disposition = (flavor.permissionDisposition ?? acpPermissionDisposition)(
                     context.input.runtimePolicy,
-                    params,
+                    request,
                   );
                   if (disposition === "allow") {
                     const optionId = selectAutoApprovedPermissionOption(params);
@@ -5470,9 +5523,10 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                   }
                   return {
                     _tag: "Pending" as const,
+                    request,
                     pending: yield* beginApprovalRequest(
                       context,
-                      params,
+                      request,
                       handlerGeneration,
                       transportRequestId,
                     ),
@@ -5507,7 +5561,8 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                 requestId,
                 transportRequestId: pendingTransportRequestId,
               } = admitted.value.pending;
-              const parsedPermission = parsePermissionRequest(params);
+              const { request } = admitted.value;
+              const parsedPermission = parsePermissionRequest(request);
               const decision = yield* Deferred.await(pendingDecision).pipe(
                 Effect.ensuring(
                   runRuntimeCallbackAtGeneration(
