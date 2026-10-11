@@ -1,4 +1,4 @@
-import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
+import { normalizeGitRemoteUrl, parseGitRemoteVerbose } from "@t3tools/shared/git";
 import {
   detectSourceControlProviderFromRemoteUrl,
   isSshRemoteUrl,
@@ -13,11 +13,9 @@ export interface GitHubRepositoryLocator {
 export function parseFetchRemotes(
   remotes: string,
 ): ReadonlyArray<{ readonly name: string; readonly url: string }> {
-  return remotes
-    .split("\n")
-    .map((line) => /^(\S+)\s+(\S+)\s+\(fetch\)$/u.exec(line.trim()))
-    .filter((match): match is RegExpExecArray => match !== null)
-    .map((match) => ({ name: match[1]!, url: match[2]! }));
+  return parseGitRemoteVerbose(remotes)
+    .filter((remote) => remote.direction === "fetch")
+    .map(({ name, url }) => ({ name, url }));
 }
 
 /**
