@@ -54,6 +54,12 @@ export function assertKiroProviderThreadResumeOutput(
     PROVIDER_THREAD_RESUME_SECOND_PROMPT,
   ]);
   assert.lengthOf(projection.providerThreads, 1, "resume must keep one provider thread");
+  assert.deepEqual(projection.providerThreads[0]?.contextUsage, {
+    usedTokens: 19_093,
+    maxTokens: 200_000,
+    compactsAutomatically: true,
+    autoCompactThreshold: 160_000,
+  });
   const answers = projection.turnItems.flatMap((item) =>
     item.type === "assistant_message" ? [item.text] : [],
   );

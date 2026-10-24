@@ -2109,15 +2109,29 @@ describe("AcpAdapterV2", () => {
         );
         const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
         const instanceId = ProviderInstanceId.make("acp-test-eager-resume");
+        let contextUsageLoads = 0;
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
         const adapter = yield* makeAcpAdapterV2({
           instanceId,
           flavor: {
             driver: ACP_TEST_DRIVER,
             capabilities: AcpProviderCapabilitiesV2,
+            contextUsageFromSession: () => {
+              contextUsageLoads += 1;
+              return { usedTokens: 100, maxTokens: 1_000 };
+            },
             makeRuntime: makeMockRuntime({
               childProcessSpawner,
               mockAgentPath,
               protocolEvents,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdateHandler = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+              }),
             }),
           },
           selfInvocation,
@@ -2148,25 +2162,68 @@ describe("AcpAdapterV2", () => {
         assert.include(startupMethods, "session/resume");
         assert.notInclude(startupMethods, "session/new");
 
-        yield* runtime.resumeThread({ providerThread, modelSelection, runtimePolicy });
+        const resumed = yield* runtime.resumeThread({
+          providerThread,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.equal(
+          contextUsageLoads,
+          0,
+          "an already-active resume must not reuse load telemetry",
+        );
+        assert.isNull(resumed.contextUsage);
         assert.notInclude(yield* pollProtocolMethods(protocolEvents), "session/resume");
+        assert.isDefined(sessionUpdateHandler);
+        yield* sessionUpdateHandler!({
+          sessionId: "persisted-session",
+          update: { sessionUpdate: "usage_update", used: 900, size: 1_000 },
+        });
+        yield* runtime.resumeThread({
+          providerThread: {
+            ...providerThread,
+            nativeThreadRef: {
+              driver: ACP_TEST_DRIVER,
+              nativeId: "other-session",
+              strength: "strong",
+            },
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        const reloaded = yield* runtime.resumeThread({
+          providerThread,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.equal(contextUsageLoads, 2);
+        assert.deepEqual(reloaded.contextUsage, { usedTokens: 100, maxTokens: 1_000 });
         const now = yield* DateTime.now;
         yield* runtime.startTurn(
           makeTurnInput({
             threadId,
-            providerThread,
+            providerThread: reloaded,
             instanceId,
             runtimePolicy,
             now,
             ordinal: 1,
           }),
         );
-        const terminal = Array.from(
+        const events = Array.from(
           yield* runtime.events.pipe(
             Stream.takeUntil((event) => event.type === "turn.terminal"),
             Stream.runCollect,
           ),
-        ).find((event) => event.type === "turn.terminal");
+        );
+        const active = events.find(
+          (event) =>
+            event.type === "provider_thread.updated" && event.providerThread.status === "active",
+        );
+        assert.deepEqual(
+          active?.type === "provider_thread.updated" ? active.providerThread.contextUsage : null,
+          { usedTokens: 100, maxTokens: 1_000 },
+        );
+        const terminal = events.find((event) => event.type === "turn.terminal");
         assert.equal(
           terminal?.providerTurnId,
           idAllocator.derive.providerTurn({

@@ -283,6 +283,15 @@ export interface AcpAdapterV2Flavor {
     selection: ModelSelection,
     session: AcpSessionRuntime.AcpSessionRuntimeStartResult,
   ) => number | undefined;
+  readonly contextUsageFromSession?: (input: {
+    readonly selection: ModelSelection;
+    readonly session: AcpSessionRuntime.AcpSessionRuntimeStartResult;
+  }) => ThreadTokenUsageSnapshot | null;
+  readonly contextUsageFromSessionUpdate?: (input: {
+    readonly selection: ModelSelection;
+    readonly session: AcpSessionRuntime.AcpSessionRuntimeStartResult;
+    readonly notification: EffectAcpSchema.SessionNotification;
+  }) => ThreadTokenUsageSnapshot | null | undefined;
   readonly applyModelSelection?: (input: {
     readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
     readonly startResult: AcpSessionRuntime.AcpSessionRuntimeStartResult;
@@ -4615,6 +4624,33 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               (event) => event._tag === "UsageUpdated" || event._tag === "SessionInfoUpdated",
             );
             if (stateEvent === undefined) return;
+            let contextUsageOverride: ThreadTokenUsageSnapshot | null | undefined;
+            if (
+              stateEvent._tag === "SessionInfoUpdated" &&
+              flavor.contextUsageFromSessionUpdate !== undefined
+            ) {
+              const selection = yield* Ref.get(activeSelection);
+              const session = yield* Ref.get(activeSessionSetup);
+              if (selection !== null && session !== null) {
+                contextUsageOverride = flavor.contextUsageFromSessionUpdate({
+                  selection,
+                  session,
+                  notification,
+                });
+                if (contextUsageOverride !== undefined) {
+                  const nextContextUsage = contextUsageOverride;
+                  yield* Ref.update(contextUsageBySessionId, (current) => {
+                    const updated = new Map(current);
+                    if (nextContextUsage === null) updated.delete(notification.sessionId);
+                    else updated.set(notification.sessionId, nextContextUsage);
+                    return updated;
+                  });
+                  if (context?.nativeThreadId === notification.sessionId) {
+                    context.contextUsage = contextUsageOverride;
+                  }
+                }
+              }
+            }
             if (stateEvent._tag === "UsageUpdated") {
               yield* Ref.update(contextUsageBySessionId, (current) =>
                 new Map(current).set(notification.sessionId, stateEvent.usage),
@@ -4642,9 +4678,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const providerThread: OrchestrationV2ProviderThread = {
                 ...knownProviderThread,
                 contextUsage:
-                  (yield* Ref.get(contextUsageBySessionId)).get(notification.sessionId) ??
-                  knownProviderThread.contextUsage ??
-                  null,
+                  contextUsageOverride !== undefined
+                    ? contextUsageOverride
+                    : ((yield* Ref.get(contextUsageBySessionId)).get(notification.sessionId) ??
+                      knownProviderThread.contextUsage ??
+                      null),
                 nativeMetadata:
                   (yield* Ref.get(nativeMetadataBySessionId)).get(notification.sessionId) ??
                   knownProviderThread.nativeMetadata ??
@@ -7984,6 +8022,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   const restartAfterInterrupt = yield* restartRuntimeAfterTeardownIfRequired(
                     threadInput.providerThread.appThreadId,
                   ).pipe(Effect.tapError(() => restorePreviousItemIdentity));
+                  let loadedContextUsage: ThreadTokenUsageSnapshot | null | undefined;
                   if ((yield* Ref.get(activeSessionId)) !== sessionId || restartAfterInterrupt) {
                     yield* Ref.set(snapshot, {
                       order: [],
@@ -8000,6 +8039,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     yield* setActiveSessionSetup(activated);
                     const nextSelection = threadInput.modelSelection ?? input.modelSelection;
                     const nextRuntimePolicy = threadInput.runtimePolicy ?? input.runtimePolicy;
+                    loadedContextUsage = flavor.contextUsageFromSession?.({
+                      selection: nextSelection,
+                      session: activated,
+                    });
+                    if (loadedContextUsage !== undefined) {
+                      const nextContextUsage = loadedContextUsage;
+                      yield* Ref.update(contextUsageBySessionId, (current) => {
+                        const updated = new Map(current);
+                        if (nextContextUsage === null) updated.delete(activated.sessionId);
+                        else updated.set(activated.sessionId, nextContextUsage);
+                        return updated;
+                      });
+                    }
                     yield* configureSession(activated, nextSelection, nextRuntimePolicy);
                     yield* Ref.set(activeSelection, nextSelection);
                     yield* Ref.set(activeInteractionMode, nextRuntimePolicy.interactionMode);
@@ -8008,6 +8060,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   return {
                     ...threadInput.providerThread,
                     providerSessionId: input.providerSessionId,
+                    ...(loadedContextUsage === undefined
+                      ? {}
+                      : { contextUsage: loadedContextUsage }),
                     status: "idle" as const,
                     updatedAt: now,
                   };
