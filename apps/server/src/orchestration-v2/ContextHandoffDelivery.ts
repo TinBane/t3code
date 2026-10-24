@@ -12,6 +12,68 @@ import {
   selectHistory,
 } from "@t3tools/provider-core/server/handoffBudget";
 
+function pendingContextHandoffs(input: {
+  readonly handoffs: ReadonlyArray<OrchestrationV2ContextHandoff>;
+  readonly providerThread: OrchestrationV2ProviderThread;
+}) {
+  const nativeThreadId = input.providerThread.nativeThreadRef?.nativeId ?? undefined;
+  return input.handoffs.filter(
+    (handoff) =>
+      nativeThreadId === undefined ||
+      handoff.delivery?.nativeThreadId !== nativeThreadId ||
+      handoff.delivery.status === "pending",
+  );
+}
+
+export function planContextHandoffDelivery(input: {
+  readonly handoffs: ReadonlyArray<OrchestrationV2ContextHandoff>;
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly budget: number;
+  readonly alreadyDeliveredItemIds: ReadonlySet<string>;
+}) {
+  const nativeThreadId = input.providerThread.nativeThreadRef?.nativeId ?? undefined;
+  const pending = pendingContextHandoffs(input);
+  if (pending.length === 0) return { status: "empty" as const };
+  let coverage = pending
+    .map(
+      (handoff) =>
+        `Context handoff (${handoff.strategy === "fork_delta_summary" ? "merge_back / fork_delta_summary" : handoff.strategy}):\n${
+          handoff.history?.coverage ??
+          `From thread ${handoff.threadId}, runs ${handoff.coveredRunOrdinals.from}-${handoff.coveredRunOrdinals.to}. Recover history with t3_thread_read, view=activity; paginate with afterPosition, and use itemId/textOffset for long items.`
+        }`,
+    )
+    .join("\n");
+  if (historyCost([], coverage) > Math.min(4_000, input.budget / 2)) {
+    const strategies = Array.from(new Set(pending.map((handoff) => handoff.strategy)));
+    coverage = `Context handoff (${strategies.join(", ")}). ${pending.length} handoff records; detailed coverage references omitted. Recover history with t3_thread_read({threadId:"${input.providerThread.appThreadId ?? pending[0]!.threadId}",view:"activity",limit:20,maxCharsPerItem:4000}); paginate with afterPosition=nextPosition. Follow fork/handoff source references in activity. For long items use itemId and textOffset=nextTextOffset until null.`;
+  }
+  const seen = new Set(input.alreadyDeliveredItemIds);
+  const messages = pending
+    .flatMap((handoff) => handoff.history?.messages ?? [])
+    .filter((message) => {
+      if (seen.has(message.itemId)) return false;
+      seen.add(message.itemId);
+      return true;
+    });
+  const oldContext = pending
+    .filter((handoff) => handoff.history === undefined)
+    .map((handoff) => handoff.summaryText)
+    .join("\n\n");
+  const fullCoverage =
+    oldContext && historyCost([], `${coverage}\n${oldContext}`) + 512 <= input.budget
+      ? `${coverage}\n${oldContext}`
+      : coverage;
+  const selected = selectHistory({
+    messages,
+    coverage: fullCoverage,
+    omittedItems: pending.reduce((sum, handoff) => sum + (handoff.history?.omittedItems ?? 0), 0),
+    budget: input.budget,
+  });
+  return historyCost(selected.messages, selected.context) > input.budget
+    ? { status: "overflow" as const }
+    : { status: "ready" as const, pending, selected, nativeThreadId };
+}
+
 /**
  * Persist before/after injection: an ambiguous pending delivery requires a fresh native thread.
  * Run `unsent` when the provider refused the turn before reading the prompt, so that
@@ -29,55 +91,25 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
     ) => Effect.Effect<boolean, InjectError>;
     readonly persist: (handoff: OrchestrationV2ContextHandoff) => Effect.Effect<void, PersistError>;
   }) {
-    const nativeThreadId = input.providerThread.nativeThreadRef?.nativeId ?? undefined;
-    const pending = input.handoffs.filter(
-      (handoff) =>
-        nativeThreadId === undefined ||
-        handoff.delivery?.nativeThreadId !== nativeThreadId ||
-        handoff.delivery.status === "pending",
-    );
-    if (pending.length === 0 || (input.deferInline && input.inject === undefined))
+    if (
+      pendingContextHandoffs(input).length === 0 ||
+      (input.deferInline && input.inject === undefined)
+    )
       return { context: "", delivered: Effect.void, unsent: Effect.void };
     const budget = typeof input.budget === "number" ? input.budget : yield* input.budget;
-    let coverage = pending
-      .map(
-        (handoff) =>
-          `Context handoff (${handoff.strategy === "fork_delta_summary" ? "merge_back / fork_delta_summary" : handoff.strategy}):\n${
-            handoff.history?.coverage ??
-            `From thread ${handoff.threadId}, runs ${handoff.coveredRunOrdinals.from}-${handoff.coveredRunOrdinals.to}. Recover history with t3_thread_read, view=activity; paginate with afterPosition, and use itemId/textOffset for long items.`
-          }`,
-      )
-      .join("\n");
-    if (historyCost([], coverage) > Math.min(4_000, budget / 2)) {
-      const strategies = Array.from(new Set(pending.map((handoff) => handoff.strategy)));
-      coverage = `Context handoff (${strategies.join(", ")}). ${pending.length} handoff records; detailed coverage references omitted. Recover history with t3_thread_read({threadId:"${input.providerThread.appThreadId ?? pending[0]!.threadId}",view:"activity",limit:20,maxCharsPerItem:4000}); paginate with afterPosition=nextPosition. Follow fork/handoff source references in activity. For long items use itemId and textOffset=nextTextOffset until null.`;
-    }
-    const seen = new Set(input.alreadyDeliveredItemIds);
-    const messages = pending
-      .flatMap((handoff) => handoff.history?.messages ?? [])
-      .filter((message) => {
-        if (seen.has(message.itemId)) return false;
-        seen.add(message.itemId);
-        return true;
-      });
-    const oldContext = pending
-      .filter((handoff) => handoff.history === undefined)
-      .map((handoff) => handoff.summaryText)
-      .join("\n\n");
-    const fullCoverage =
-      oldContext && historyCost([], `${coverage}\n${oldContext}`) + 512 <= budget
-        ? `${coverage}\n${oldContext}`
-        : coverage;
-    const selected = selectHistory({
-      messages,
-      coverage: fullCoverage,
-      omittedItems: pending.reduce((sum, handoff) => sum + (handoff.history?.omittedItems ?? 0), 0),
+    const plan = planContextHandoffDelivery({
+      handoffs: input.handoffs,
+      providerThread: input.providerThread,
       budget,
+      alreadyDeliveredItemIds: input.alreadyDeliveredItemIds,
     });
-    if (historyCost(selected.messages, selected.context) > budget) {
+    if (plan.status === "empty")
+      return { context: "", delivered: Effect.void, unsent: Effect.void };
+    if (plan.status === "overflow") {
       if (input.deferInline) return { context: "", delivered: Effect.void, unsent: Effect.void };
       return yield* new ContextHandoffBudgetError();
     }
+    const { nativeThreadId, pending, selected } = plan;
     const omittedItemIds = new Set(selected.omittedItemIds);
     const persist = (status: "pending" | "injected" | "inline") =>
       Effect.forEach(

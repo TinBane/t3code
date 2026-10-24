@@ -412,6 +412,9 @@ describe("orchestration v2 provider switching", () => {
     "screenshot-fallback",
     "screenshot-reported-capacity-native",
     "screenshot-option-change-retry-native",
+    "prior-images-reasoning-change-overflow-native",
+    "prior-images-reasoning-change-overflow-oversized-native",
+    "prior-images-reasoning-change-overflow-compact-native",
     "prior-images-reasoning-change-replacement-small-native",
     "imported-prior-images-fallback",
     "prior-images-telemetry-native",
@@ -433,6 +436,7 @@ describe("orchestration v2 provider switching", () => {
         const generation = yield* Ref.make(0);
         const priorImages = scenario.includes("prior-images");
         const replaceNative = scenario.includes("replacement");
+        const replaceForOverflow = scenario.includes("overflow");
         const capacityScenario = modelScenario || scenario.includes("reported-capacity");
         const returning =
           scenario === "large-current-input" || scenario.includes("-change-") || priorImages;
@@ -463,7 +467,11 @@ describe("orchestration v2 provider switching", () => {
             responseByRunOrdinal: {},
             capturedTurns,
             ...(scenario.includes("retry") || scenario.includes("unsent") ? { failStartOnce } : {}),
-            ...(replaceNative ? { failResumeOnce, nativeThreadGeneration: generation } : {}),
+            ...(replaceNative
+              ? { failResumeOnce, nativeThreadGeneration: generation }
+              : replaceForOverflow
+                ? { nativeThreadGeneration: generation }
+                : {}),
             ...(scenario.includes("reported-capacity")
               ? { initialContextUsage: { usedTokens: 999_999, maxTokens: 1_000_000 } }
               : {}),
@@ -472,7 +480,7 @@ describe("orchestration v2 provider switching", () => {
                   canReuseContextUsage: canReuseCodexContextUsage,
                   tokenUsageByRunOrdinal: {
                     2: {
-                      usedTokens: replaceNative ? 30_000 : 37_321,
+                      usedTokens: replaceNative ? 30_000 : replaceForOverflow ? 250_000 : 37_321,
                       maxTokens: replaceNative
                         ? scenario.includes("small")
                           ? 32_000
@@ -537,13 +545,15 @@ describe("orchestration v2 provider switching", () => {
                       ...screenshot,
                       id: `prior-${index}`,
                     }))
-                  : turnUsageScenario && ordinal >= targetOrdinal
-                    ? [screenshot, { ...screenshot, id: "current-2" }]
-                    : scenario.startsWith("screenshot") && ordinal >= targetOrdinal
-                      ? screenshots
-                      : priorImages && ordinal === (scenario.startsWith("imported") ? 1 : 2)
-                        ? [screenshot]
-                        : [],
+                  : scenario.includes("overflow-compact") && ordinal >= targetOrdinal
+                    ? []
+                    : turnUsageScenario && ordinal >= targetOrdinal
+                      ? [screenshot, { ...screenshot, id: "current-2" }]
+                      : scenario.startsWith("screenshot") && ordinal >= targetOrdinal
+                        ? screenshots
+                        : priorImages && ordinal === (scenario.startsWith("imported") ? 1 : 2)
+                          ? [screenshot]
+                          : [],
               modelSelection: selection,
               dispatchMode: { type: "start_immediately" },
             });
@@ -593,13 +603,17 @@ describe("orchestration v2 provider switching", () => {
                 )
               : undefined;
           yield* Effect.addFinalizer(() => Effect.sync(() => spy?.mockRestore()));
-          const current = scenario.startsWith("compact")
-            ? "/compact"
-            : capacityScenario && !turnUsageScenario
-              ? "x".repeat(70_000)
-              : scenario === "large-current-input"
-                ? "x".repeat(9_000)
-                : "Continue work";
+          const current = scenario.includes("overflow-oversized")
+            ? "x".repeat(300_000)
+            : scenario.includes("overflow-compact")
+              ? "/compact"
+              : scenario.startsWith("compact")
+                ? "/compact"
+                : capacityScenario && !turnUsageScenario
+                  ? "x".repeat(70_000)
+                  : scenario === "large-current-input"
+                    ? "x".repeat(9_000)
+                    : "Continue work";
           if (returning) {
             if (scenario.includes("unsent")) yield* Ref.set(failStartOnce, true);
             yield* dispatch(
@@ -731,6 +745,37 @@ describe("orchestration v2 provider switching", () => {
               (yield* Ref.get(capturedTurns)).at(-1)!.driver,
               scenario.includes("small") ? CODEX_DRIVER : CLAUDE_DRIVER,
             );
+            return;
+          }
+          if (replaceForOverflow) {
+            const replaced = yield* orchestrator.getThreadProjection(threadId);
+            if (scenario.includes("overflow-oversized")) {
+              assert.equal(replaced.runs.at(-1)?.status, "failed");
+              const target = replaced.providerThreads.find(
+                (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+              )!;
+              assert.equal(yield* Ref.get(generation), 1);
+              assert.equal(target.nativeThreadRef?.nativeId?.endsWith(":0"), true);
+              return;
+            }
+            assert.equal(replaced.runs.at(-1)?.status, "completed");
+            const target = replaced.providerThreads.find(
+              (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+            )!;
+            if (scenario.includes("overflow-compact")) {
+              assert.equal(yield* Ref.get(generation), 1);
+              assert.equal(target.nativeThreadRef?.nativeId?.endsWith(":0"), true);
+              return;
+            }
+            assert.isNull(target.contextUsage);
+            assert.equal(yield* Ref.get(generation), 2);
+            const accepted = (yield* Ref.get(capturedTurns)).at(-1)!;
+            assert.equal(accepted.driver, CLAUDE_DRIVER);
+            assert.equal(accepted.nativeThreadId?.endsWith(":1"), true);
+            assert.equal(accepted.text, "Continue work");
+            const history = yield* encodeJson(yield* Ref.get(injectedHistory));
+            assert.include(history, "Original request with constraints");
+            assert.include(history, "New source constraint");
             return;
           }
           if (replaceNative) {
