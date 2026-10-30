@@ -36,6 +36,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import { CommandPolicyCapabilityUnsupportedError } from "../CommandPolicy.ts";
 import {
+  ClaudeAgentSdkQueryRunnerError,
   ClaudeAppendSystemPromptFileError,
   ClaudeBackgroundWorkBlocksQueryReplacementError,
   ClaudeProviderCapabilitiesV2,
@@ -103,8 +104,6 @@ function makeTestAdapter(input: {
   readonly failInjectionOnce?: Ref.Ref<boolean>;
   readonly nativeThreadGeneration?: Ref.Ref<number>;
   readonly failResume?: boolean;
-  readonly hasPendingBackgroundWork?: boolean;
-  readonly reuseNativeThread?: boolean;
   readonly failResumeOnce?: Ref.Ref<boolean>;
   readonly initialContextUsage?: OrchestrationV2ProviderThread["contextUsage"];
   readonly getModelContextWindow?: (selection: ModelSelection) => number | undefined;
@@ -116,6 +115,8 @@ function makeTestAdapter(input: {
   readonly failedRunOrdinals?: ReadonlySet<number>;
   readonly interruptedRunOrdinals?: ReadonlySet<number>;
   readonly holdRunOrdinal?: number;
+  readonly pendingBackgroundWork?: Ref.Ref<boolean>;
+  readonly subagentOnlyBackgroundWork?: boolean;
   readonly holdFirstTurn?: Deferred.Deferred<void>;
   readonly releaseFirstTurn?: Deferred.Deferred<void>;
 }): ProviderAdapter.ProviderAdapterV2["Service"] {
@@ -147,8 +148,14 @@ function makeTestAdapter(input: {
           providerSessionId: sessionInput.providerSessionId,
           providerSession,
           events: Stream.fromPubSub(events),
-          hasPendingBackgroundWork: Effect.succeed(input.hasPendingBackgroundWork ?? false),
-          hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+          ...(input.pendingBackgroundWork === undefined
+            ? {}
+            : {
+                hasPendingBackgroundWorkForThread: (_thread, options) =>
+                  input.subagentOnlyBackgroundWork && options?.includeSubagents !== true
+                    ? Effect.succeed(false)
+                    : Ref.get(input.pendingBackgroundWork!),
+              }),
           ...(input.getModelContextWindow === undefined
             ? {}
             : { getModelContextWindow: input.getModelContextWindow }),
@@ -161,7 +168,7 @@ function makeTestAdapter(input: {
               const generation =
                 input.nativeThreadGeneration === undefined
                   ? ""
-                  : `:${input.reuseNativeThread && threadInput.forceNewNativeThread ? 0 : yield* Ref.getAndUpdate(input.nativeThreadGeneration, (value) => value + 1)}`;
+                  : `:${yield* Ref.getAndUpdate(input.nativeThreadGeneration, (value) => value + 1)}`;
               const nativeThreadId = `${input.driver}:${threadInput.threadId}${generation}`;
               return {
                 id: ProviderThreadId.make(`provider-thread:${nativeThreadId}`),
@@ -408,6 +415,12 @@ const waitForIdle = Effect.fn("ProviderSwitchTest.waitForIdle")(function* (
   return idle;
 });
 
+// Same tag as the adapter's unexported error raised when Claude never answers setMcpServers.
+class ClaudeMcpRegistrationTimeoutError extends Schema.TaggedError<ClaudeMcpRegistrationTimeoutError>()(
+  "ClaudeMcpRegistrationTimeoutError",
+  {},
+) {}
+
 describe("orchestration v2 provider switching", () => {
   it.live.each([
     "compact-native",
@@ -416,20 +429,20 @@ describe("orchestration v2 provider switching", () => {
     "screenshot-fallback",
     "screenshot-reported-capacity-native",
     "screenshot-option-change-retry-native",
-    "prior-images-reasoning-change-overflow-native",
-    "prior-images-reasoning-change-overflow-inline",
-    "prior-images-reasoning-change-overflow-background-native",
-    "prior-images-reasoning-change-overflow-reused-native",
-    "prior-images-reasoning-change-overflow-oversized-native",
-    "reasoning-change-overflow-prospective-payload-native",
-    "prior-images-reasoning-change-overflow-prospective-payload-trimmed-native",
-    "turn-usage-model-change-overflow-unknown-window-native",
-    "prior-images-reasoning-change-overflow-compact-native",
+    "screenshot-exhausted-target-native",
+    "screenshot-exhausted-target-reused-native",
+    "screenshot-exhausted-target-fallback",
+    "screenshot-exhausted-target-estimate-native",
+    "screenshot-exhausted-target-oversized-native",
+    "screenshot-exhausted-target-tight-native",
+    "screenshot-exhausted-target-background-native",
+    "screenshot-exhausted-target-subagent-native",
     "prior-images-reasoning-change-replacement-small-native",
     "imported-prior-images-fallback",
     "prior-images-telemetry-native",
     "prior-images-unsent-native",
     "prior-images-legacy-replacement-native",
+    "prior-images-replacement-reused-native",
     "delivery-write-failure",
   ] as const)("preserves handoffs through %s", (scenario) =>
     Effect.scoped(
@@ -444,12 +457,17 @@ describe("orchestration v2 provider switching", () => {
         const failStartOnce = yield* Ref.make(false);
         const failResumeOnce = yield* Ref.make(false);
         const generation = yield* Ref.make(0);
+        const pendingBackgroundWork = yield* Ref.make(false);
         const priorImages = scenario.includes("prior-images");
+        const exhaustedTarget = scenario.includes("exhausted-target");
         const replaceNative = scenario.includes("replacement");
-        const replaceForOverflow = scenario.includes("overflow");
+        const reuseNative = scenario.includes("-reused-");
         const capacityScenario = modelScenario || scenario.includes("reported-capacity");
         const returning =
-          scenario === "large-current-input" || scenario.includes("-change-") || priorImages;
+          scenario === "large-current-input" ||
+          scenario.includes("-change-") ||
+          priorImages ||
+          exhaustedTarget;
         const targetSelection: ModelSelection = !modelScenario
           ? CLAUDE_MODEL_SELECTION
           : {
@@ -474,16 +492,21 @@ describe("orchestration v2 provider switching", () => {
             driver: CLAUDE_DRIVER,
             capabilities: ClaudeProviderCapabilitiesV2,
             modelSelection: CLAUDE_MODEL_SELECTION,
-            responseByRunOrdinal: {},
-            hasPendingBackgroundWork: scenario.includes("overflow-background"),
-            reuseNativeThread: scenario.includes("overflow-reused"),
+            responseByRunOrdinal: scenario.includes("target-estimate")
+              ? { 2: "x".repeat(10_000) }
+              : {},
             capturedTurns,
             ...(scenario.includes("retry") || scenario.includes("unsent") ? { failStartOnce } : {}),
-            ...(replaceNative
-              ? { failResumeOnce, nativeThreadGeneration: generation }
-              : replaceForOverflow
-                ? { nativeThreadGeneration: generation }
-                : {}),
+            ...(replaceNative ? { failResumeOnce } : {}),
+            ...((replaceNative || exhaustedTarget) && !reuseNative
+              ? { nativeThreadGeneration: generation }
+              : {}),
+            ...(scenario.includes("target-background") || scenario.includes("target-subagent")
+              ? {
+                  pendingBackgroundWork,
+                  subagentOnlyBackgroundWork: scenario.includes("target-subagent"),
+                }
+              : {}),
             ...(scenario.includes("reported-capacity")
               ? { initialContextUsage: { usedTokens: 999_999, maxTokens: 1_000_000 } }
               : {}),
@@ -492,22 +515,12 @@ describe("orchestration v2 provider switching", () => {
                   canReuseContextUsage: canReuseCodexContextUsage,
                   tokenUsageByRunOrdinal: {
                     2: {
-                      usedTokens: scenario.includes("prospective-payload")
-                        ? 16_850
-                        : replaceNative
-                          ? 30_000
-                          : replaceForOverflow
-                            ? 250_000
-                            : 37_321,
+                      usedTokens: replaceNative ? 30_000 : 37_321,
                       maxTokens: replaceNative
                         ? scenario.includes("small")
                           ? 32_000
                           : 64_000
-                        : scenario.includes("prospective-payload")
-                          ? scenario.includes("trimmed")
-                            ? 19_000
-                            : 16_935
-                          : 258_400,
+                        : 258_400,
                     },
                   },
                 }
@@ -521,8 +534,11 @@ describe("orchestration v2 provider switching", () => {
                         ? 1_000_000
                         : 32_000,
                   }
-                : scenario === "large-current-input" || priorImages
-                  ? { getModelContextWindow: () => 32_000 }
+                : scenario === "large-current-input" || priorImages || exhaustedTarget
+                  ? {
+                      getModelContextWindow: () =>
+                        scenario.includes("target-tight") ? 25_121 : 32_000,
+                    }
                   : {}),
             ...(scenario.endsWith("-native") || scenario === "large-current-input"
               ? { injectedHistory }
@@ -562,22 +578,20 @@ describe("orchestration v2 provider switching", () => {
               creationSource: "web",
               text,
               attachments:
-                turnUsageScenario && !scenario.includes("prospective-payload") && ordinal === 2
+                turnUsageScenario && ordinal === 2
                   ? Array.from({ length: 8 }, (_, index) => ({
                       ...screenshot,
                       id: `prior-${index}`,
                     }))
-                  : scenario.includes("overflow-compact") && ordinal >= targetOrdinal
-                    ? []
-                    : turnUsageScenario &&
-                        !scenario.includes("prospective-payload") &&
-                        ordinal >= targetOrdinal
-                      ? [screenshot, { ...screenshot, id: "current-2" }]
-                      : scenario.startsWith("screenshot") && ordinal >= targetOrdinal
-                        ? screenshots
-                        : priorImages && ordinal === (scenario.startsWith("imported") ? 1 : 2)
-                          ? [screenshot]
-                          : [],
+                  : turnUsageScenario && ordinal >= targetOrdinal
+                    ? [screenshot, { ...screenshot, id: "current-2" }]
+                    : scenario.startsWith("screenshot") &&
+                        ordinal >= targetOrdinal &&
+                        (!exhaustedTarget || ordinal === targetOrdinal)
+                      ? screenshots
+                      : priorImages && ordinal === (scenario.startsWith("imported") ? 1 : 2)
+                        ? [screenshot]
+                        : [],
               modelSelection: selection,
               dispatchMode: { type: "start_immediately" },
             });
@@ -627,27 +641,51 @@ describe("orchestration v2 provider switching", () => {
                 )
               : undefined;
           yield* Effect.addFinalizer(() => Effect.sync(() => spy?.mockRestore()));
-          const current = scenario.includes("overflow-oversized")
-            ? "x".repeat(300_000)
-            : scenario.includes("unknown-window")
-              ? "Continue work"
-              : scenario.includes("overflow-compact")
-                ? "/compact"
-                : scenario.startsWith("compact")
-                  ? "/compact"
-                  : capacityScenario && !turnUsageScenario
-                    ? "x".repeat(70_000)
-                    : scenario === "large-current-input"
-                      ? "x".repeat(9_000)
-                      : "Continue work";
+          const current = scenario.startsWith("compact")
+            ? "/compact"
+            : scenario.includes("target-oversized")
+              ? "x".repeat(40_000)
+              : capacityScenario && !turnUsageScenario
+                ? "x".repeat(70_000)
+                : scenario === "large-current-input"
+                  ? "x".repeat(9_000)
+                  : "Continue work";
           if (returning) {
             if (scenario.includes("unsent")) yield* Ref.set(failStartOnce, true);
             yield* dispatch(
               2,
-              turnUsageScenario ? "x".repeat(27_460) : "Establish target",
+              turnUsageScenario
+                ? "x".repeat(27_460)
+                : scenario.includes("target-estimate")
+                  ? "x".repeat(12_000)
+                  : "Establish target",
               CLAUDE_MODEL_SELECTION,
             );
             yield* wait(2);
+            if (exhaustedTarget) {
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)?.status,
+                "completed",
+              );
+            }
+            if (exhaustedTarget && !scenario.includes("target-estimate")) {
+              const target = (yield* orchestrator.getThreadProjection(
+                threadId,
+              )).providerThreads.find(
+                (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+              )!;
+              yield* eventSink.write({
+                events: [
+                  {
+                    id: EventId.make("exhausted-target-usage"),
+                    type: "provider-thread.updated",
+                    threadId,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...target, contextUsage: { usedTokens: 30_000, maxTokens: 32_000 } },
+                  },
+                ],
+              });
+            }
             if (modelScenario && !turnUsageScenario) {
               const target = (yield* orchestrator.getThreadProjection(
                 threadId,
@@ -728,8 +766,31 @@ describe("orchestration v2 provider switching", () => {
             yield* Ref.set(failResumeOnce, true);
           }
           if (scenario.includes("retry")) yield* Ref.set(failStartOnce, true);
+          if (scenario.includes("target-background") || scenario.includes("target-subagent"))
+            yield* Ref.set(pendingBackgroundWork, true);
           yield* dispatch(targetOrdinal, current, targetSelection);
           yield* wait(targetOrdinal);
+          if (reuseNative) {
+            const projection = yield* orchestrator.getThreadProjection(threadId);
+            assert.equal(projection.runs.at(-1)?.status, "failed");
+            const turns = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.driver === CLAUDE_DRIVER,
+            );
+            assert.lengthOf(turns, 1);
+            const target = projection.providerThreads.find(
+              (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+            )!;
+            assert.equal(target.nativeThreadRef?.nativeId, turns[0]!.nativeThreadId);
+            assert.isFalse(
+              projection.contextHandoffs.some(
+                (handoff) =>
+                  handoff.targetRunId === projection.runs.at(-1)?.id &&
+                  handoff.strategy === "full_thread_summary" &&
+                  handoff.fromProviderThreadIds.includes(target.id),
+              ),
+            );
+            return;
+          }
           if (scenario.includes("retry")) {
             const failed = yield* orchestrator.getThreadProjection(threadId);
             assert.equal(failed.runs.at(-1)?.status, "failed");
@@ -773,54 +834,6 @@ describe("orchestration v2 provider switching", () => {
             );
             return;
           }
-          if (replaceForOverflow) {
-            const replaced = yield* orchestrator.getThreadProjection(threadId);
-            if (
-              scenario.includes("overflow-oversized") ||
-              scenario.includes("overflow-background") ||
-              scenario.includes("overflow-reused") ||
-              scenario.includes("prospective-payload") ||
-              scenario.includes("unknown-window")
-            ) {
-              assert.equal(replaced.runs.at(-1)?.status, "failed");
-              const target = replaced.providerThreads.find(
-                (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
-              )!;
-              assert.equal(yield* Ref.get(generation), 1);
-              assert.equal(target.nativeThreadRef?.nativeId?.endsWith(":0"), true);
-              if (scenario.includes("overflow-reused")) {
-                assert.isFalse(
-                  replaced.contextHandoffs.some(
-                    (handoff) =>
-                      handoff.targetRunId === replaced.runs.at(-1)?.id &&
-                      handoff.fromProviderThreadIds.includes(target.id),
-                  ),
-                );
-              }
-              return;
-            }
-            assert.equal(replaced.runs.at(-1)?.status, "completed");
-            const target = replaced.providerThreads.find(
-              (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
-            )!;
-            if (scenario.includes("overflow-compact")) {
-              assert.equal(yield* Ref.get(generation), 1);
-              assert.equal(target.nativeThreadRef?.nativeId?.endsWith(":0"), true);
-              return;
-            }
-            assert.isNull(target.contextUsage);
-            assert.equal(yield* Ref.get(generation), 2);
-            const accepted = (yield* Ref.get(capturedTurns)).at(-1)!;
-            assert.equal(accepted.driver, CLAUDE_DRIVER);
-            assert.equal(accepted.nativeThreadId?.endsWith(":1"), true);
-            assert.include(accepted.text, "Continue work");
-            const history = scenario.endsWith("-native")
-              ? yield* encodeJson(yield* Ref.get(injectedHistory))
-              : accepted.text;
-            assert.include(history, "Original request with constraints");
-            assert.include(history, "New source constraint");
-            return;
-          }
           if (replaceNative) {
             if (scenario.includes("legacy-replacement")) {
               const recovered = yield* orchestrator.getThreadProjection(threadId);
@@ -861,7 +874,73 @@ describe("orchestration v2 provider switching", () => {
             yield* wait(targetOrdinal + 3);
           }
           const projection = yield* orchestrator.getThreadProjection(threadId);
+          if (
+            scenario.includes("target-oversized") ||
+            scenario.includes("target-tight") ||
+            scenario.includes("target-background") ||
+            scenario.includes("target-subagent")
+          ) {
+            assert.equal(projection.runs.at(-1)?.status, "failed");
+            assert.equal(yield* Ref.get(generation), 1);
+            assert.equal(projection.messages.at(-1)!.text, current);
+            assert.deepEqual(projection.messages.at(-1)!.attachments, screenshots);
+            if (scenario.includes("target-background") || scenario.includes("target-subagent")) {
+              assert.isTrue(yield* Ref.get(pendingBackgroundWork));
+              const failure = projection.turnItems.findLast((item) => item.type === "error");
+              assert.equal(
+                failure?.type === "error" ? failure.failure.message : null,
+                "The target provider still has background work running. Wait for it to finish or stop it before retrying the handoff.",
+              );
+            }
+            return;
+          }
           assert.equal(projection.runs.at(-1)?.status, "completed");
+          if (exhaustedTarget) {
+            assert.equal(yield* Ref.get(generation), 2);
+            const turns = (yield* Ref.get(capturedTurns)).filter(
+              (turn) => turn.driver === CLAUDE_DRIVER,
+            );
+            assert.notEqual(turns[0]!.nativeThreadId, turns[1]!.nativeThreadId);
+            const latestRun = projection.runs.at(-1)!;
+            assert.equal(
+              projection.attempts.find((attempt) => attempt.id === latestRun.activeAttemptId)!
+                .nativeThreadId,
+              turns[1]!.nativeThreadId,
+            );
+            const context = scenario.endsWith("-native")
+              ? yield* encodeJson(yield* Ref.get(injectedHistory))
+              : turns[1]!.text;
+            assert.include(context, "Original request with constraints");
+            assert.include(context, "Original partial work");
+            assert.include(context, "New source constraint");
+            assert.include(turns[1]!.text, current);
+            assert.deepEqual(turns[1]!.attachments, screenshots);
+            const historyBeforeFollowup = yield* Ref.get(injectedHistory);
+            yield* dispatch(5, "Continue after automatic recovery", CLAUDE_MODEL_SELECTION);
+            yield* wait(5);
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)?.status,
+              "completed",
+            );
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.equal(
+              (yield* Ref.get(capturedTurns)).at(-1)!.text,
+              "Continue after automatic recovery",
+            );
+            assert.deepEqual(yield* Ref.get(injectedHistory), historyBeforeFollowup);
+            if (scenario.includes("target-estimate")) {
+              yield* dispatch(6, "Another source turn", CODEX_MODEL_SELECTION);
+              yield* wait(6);
+              yield* dispatch(7, "Return after recovery", CLAUDE_MODEL_SELECTION);
+              yield* wait(7);
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)?.status,
+                "completed",
+              );
+              assert.equal(yield* Ref.get(generation), 2);
+            }
+            return;
+          }
           if (priorImages) {
             const handoff = projection.contextHandoffs.at(-1)!;
             const context = scenario.endsWith("-native")
@@ -982,7 +1061,12 @@ describe("orchestration v2 provider switching", () => {
       }),
     ),
   );
-  it.live.each(["turn-start", "injection", "large-missed-request"] as const)(
+  it.live.each([
+    "turn-start",
+    "injection",
+    "large-missed-request",
+    "exhausted-target-retry",
+  ] as const)(
     "recovers %s failure without duplicating history in the same native thread",
     (failure) =>
       Effect.scoped(
@@ -1080,6 +1164,22 @@ describe("orchestration v2 provider switching", () => {
               failure !== "injection" ? "injected" : "pending",
             );
             const historyBeforeRetry = (yield* Ref.get(injectedHistory)).length;
+            if (failure === "exhausted-target-retry") {
+              const target = failed.providerThreads.find(
+                (thread) => thread.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+              )!;
+              yield* (yield* EventSink.EventSinkV2).write({
+                events: [
+                  {
+                    id: EventId.make("exhausted-retry-usage"),
+                    type: "provider-thread.updated",
+                    threadId,
+                    occurredAt: yield* DateTime.now,
+                    payload: { ...target, contextUsage: { usedTokens: 30_000, maxTokens: 32_000 } },
+                  },
+                ],
+              });
+            }
             const retryText =
               failure === "large-missed-request" ? "y".repeat(10_000) : "Retry target request";
             yield* dispatch(3, retryText, CLAUDE_MODEL_SELECTION);
@@ -1087,7 +1187,7 @@ describe("orchestration v2 provider switching", () => {
             const retried = yield* orchestrator.getThreadProjection(threadId);
             const lastTurn = (yield* Ref.get(capturedTurns)).at(-1)!;
             assert.equal(lastTurn.text, retryText);
-            if (failure !== "injection") {
+            if (failure !== "injection" && failure !== "exhausted-target-retry") {
               const delta = yield* encodeJson(
                 (yield* Ref.get(injectedHistory)).slice(historyBeforeRetry),
               );
@@ -1399,6 +1499,13 @@ describe("orchestration v2 provider switching", () => {
   it.live.each([
     ["background work", new ClaudeBackgroundWorkBlocksQueryReplacementError()],
     ["an unreadable append file", new ClaudeAppendSystemPromptFileError({ path: "missing.md" })],
+    [
+      "an MCP registration timeout",
+      new ClaudeAgentSdkQueryRunnerError({
+        method: "setMcpServers",
+        cause: new ClaudeMcpRegistrationTimeoutError(),
+      }),
+    ],
   ] as const)("keeps the native session after turns refused for %s", ([, refusalCause]) =>
     Effect.scoped(
       Effect.gen(function* () {
